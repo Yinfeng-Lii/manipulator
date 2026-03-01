@@ -8,7 +8,7 @@ def generate_launch_description():
     desc_share = get_package_share_directory("mycobot_description")
     xacro_path = os.path.join(desc_share, "urdf", "robots", "mycobot_280.urdf.xacro")
 
-    robot_description = {"robot_description": Command(["xacro ", xacro_path])}
+    robot_description = {"robot_description": Command(["xacro", xacro_path])}
 
     rsp = Node(
         package="robot_state_publisher",
