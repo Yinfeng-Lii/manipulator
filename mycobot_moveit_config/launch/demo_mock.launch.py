@@ -8,7 +8,7 @@ def generate_launch_description():
     desc_share = get_package_share_directory("mycobot_description")
     xacro_path = os.path.join(desc_share, "urdf", "robots", "mycobot_280.urdf.xacro")
 
-    robot_description = {"robot_description": Command(["xacro ", xacro_path])}
+    robot_description = {"robot_description": Command(["xacro", xacro_path])}
 
     rsp = Node(
         package="robot_state_publisher",
@@ -49,10 +49,6 @@ def generate_launch_description():
         output="screen",
     )
 
-    moveit = Node(
-        package="mycobot_moveit_config",
-        executable="move_group.launch.py",  # 如果你仓库里是 launch 文件，需要 IncludeLaunchDescription；这里先不展开
-    )
 
     # 更稳的做法：直接 ros2 launch mycobot_moveit_config move_group.launch.py
     # 所以这里 demo_mock.launch.py 只负责 rsp + control + spawners

@@ -31,7 +31,7 @@ from moveit_msgs.msg import (  # noqa: E402
 from shape_msgs.msg import SolidPrimitive  # noqa: E402
 from geometry_msgs.msg import PoseStamped, Quaternion  # noqa: E402
 
-from control_msgs.action import FollowJointTrajectory  # noqa: E402
+from control_msgs.action import FollowJointTrajectory, GripperCommand  # noqa: E402
 from rclpy.action import ActionClient  # noqa: E402
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint  # noqa: E402
 
@@ -71,7 +71,10 @@ def _extract_joint_index(name: str):
     nums = re.findall(r"\d+", name)
     if not nums:
         return None
-    return int(nums[-1])
+
+    # 对于 link1_to_link2 这类命名，第一段数字才是关节序号。
+    # 取最后一段会把 link1_to_link2 误判成 joint2，导致真机关节映射错位。
+    return int(nums[0])
 
 
 class State(Enum):
@@ -109,9 +112,12 @@ class ArmWorker(Node):
         self.max_vel_scale = 0.15
         self.max_acc_scale = 0.15
 
-        # OMPL vs LIN position box
+        # Position constraint box
         self.pos_box_m = 0.03
         self.pos_box_m_lin = 0.001
+        # pick 任务为了避免横向漂移，收紧 pregrasp 与下抓目标容差
+        self.pick_pregrasp_box_m = 0.001
+        self.pick_down_box_m = 0.0002
 
         # ---------------- 末端约束：tcp +Y 对齐 base -Z（保持第一版） ----------------
         # 选择 R = RotX(-90deg)：
@@ -154,6 +160,10 @@ class ArmWorker(Node):
         self.gripper_verify_tol = 20
         self.gripper_retries = 3
 
+        # 仿真 GripperActionController 的关节位置（需落在 URDF 关节限位内）
+        self.sim_gripper_open_pos = 0.15
+        self.sim_gripper_close_pos = -0.65
+
         # 抓取即时判定 + 重试节奏
         self.grasp_check_delay_sec = 0.35
         self.grasp_success_min_value = 35
@@ -165,9 +175,13 @@ class ArmWorker(Node):
         self._gripper_monitor_timer = None
 
         # ---------------- ROS ----------------
+        self.command_topic = "/arm_command"
         self.plan_cli = self.create_client(GetMotionPlan, "/plan_kinematic_path")
         self.exec_ac = ActionClient(self, FollowJointTrajectory, "/arm_controller/follow_joint_trajectory")
-        self.sub = self.create_subscription(String, "arm_command", self.command_callback, 10)
+        self.gripper_ac = ActionClient(self, GripperCommand, "/gripper_action_controller/gripper_cmd")
+        self.gripper_traj_ac = ActionClient(self, FollowJointTrajectory, "/gripper_action_controller/follow_joint_trajectory")
+        self.gripper_traj_ac_legacy = ActionClient(self, FollowJointTrajectory, "/gripper_controller/follow_joint_trajectory")
+        self.sub = self.create_subscription(String, self.command_topic, self.command_callback, 10)
         self.js_pub = self.create_publisher(JointState, "/joint_states", 10)
 
         # joint mapping (MoveIt -> HW)
@@ -216,10 +230,25 @@ class ArmWorker(Node):
             self.get_logger().error("❌ /plan_kinematic_path not available. Is move_group running?")
 
         if not self.mc:
-            self.exec_ac.wait_for_server(timeout_sec=10.0)
+            arm_ready = self.exec_ac.wait_for_server(timeout_sec=10.0)
+            grip_cmd_ready = self.gripper_ac.wait_for_server(timeout_sec=2.0)
+
+            # 兼容旧安装包/历史版本：若属性不存在则懒创建，避免直接崩溃。
+            gripper_traj_ac = getattr(self, "gripper_traj_ac", None)
+            if gripper_traj_ac is None:
+                self.get_logger().warn("gripper_traj_ac missing, creating fallback trajectory client")
+                gripper_traj_ac = ActionClient(self, FollowJointTrajectory, "/gripper_controller/follow_joint_trajectory")
+                self.gripper_traj_ac = gripper_traj_ac
+            grip_traj_ready = gripper_traj_ac.wait_for_server(timeout_sec=3.0)
+            grip_traj_legacy_ready = self.gripper_traj_ac_legacy.wait_for_server(timeout_sec=1.0)
+
+            if not arm_ready:
+                self.get_logger().error("❌ /arm_controller/follow_joint_trajectory not available")
+            if not grip_cmd_ready and not grip_traj_ready and not grip_traj_legacy_ready:
+                self.get_logger().warn("⚠️ 未发现夹爪 action server（gripper_cmd / gripper_action_controller/follow_joint_trajectory），仿真夹爪将不可见")
 
         self.timer_tick = self.create_timer(0.02, self._tick)
-        self.get_logger().info("ArmWorker ready.")
+        self.get_logger().info(f"ArmWorker ready. command_topic={self.command_topic}")
 
     # -----------------------------
     # busy 判断（掉落检测用）
@@ -314,6 +343,9 @@ class ArmWorker(Node):
         self.has_object = False
 
     def _gripper_open(self) -> bool:
+        if not self.mc:
+            return self._gripper_sim(open_gripper=True)
+
         return self._set_gripper_and_verify(
             self.gripper_open_value,
             self.gripper_cmd_speed,
@@ -324,6 +356,9 @@ class ArmWorker(Node):
         )
 
     def _gripper_close(self) -> bool:
+        if not self.mc:
+            return self._gripper_sim(open_gripper=False)
+
         return self._set_gripper_and_verify(
             self.gripper_close_value,
             self.gripper_cmd_speed,
@@ -358,6 +393,68 @@ class ArmWorker(Node):
 
         self.get_logger().info(f"✅ 抓取成功：夹爪值={v} > {self.grasp_success_min_value}")
         return True
+
+    def _gripper_sim(self, *, open_gripper: bool) -> bool:
+        target = self.sim_gripper_open_pos if open_gripper else self.sim_gripper_close_pos
+        action = "open" if open_gripper else "close"
+
+        if self.gripper_ac.server_is_ready():
+            cmd = GripperCommand.Goal()
+            cmd.command.max_effort = 100.0
+            cmd.command.position = target
+            self.get_logger().info(f"SIM gripper {action} (GripperCommand): position={target:.3f}")
+            fut = self.gripper_ac.send_goal_async(cmd)
+            fut.add_done_callback(lambda f: self._on_sim_gripper_goal_sent(f, open_gripper))
+            return True
+
+        traj_clients = [
+            getattr(self, "gripper_traj_ac", None),
+            getattr(self, "gripper_traj_ac_legacy", None),
+        ]
+        for traj_ac in traj_clients:
+            if traj_ac is None or (not traj_ac.server_is_ready()):
+                continue
+
+            traj = JointTrajectory()
+            traj.joint_names = ["gripper_controller"]
+            pt = JointTrajectoryPoint()
+            pt.positions = [float(target)]
+            pt.time_from_start.sec = 0
+            pt.time_from_start.nanosec = int(0.5 * 1e9)
+            traj.points = [pt]
+
+            goal = FollowJointTrajectory.Goal()
+            goal.trajectory = traj
+            self.get_logger().info(f"SIM gripper {action} (JointTrajectory): position={target:.3f}")
+            traj_ac.send_goal_async(goal)
+            return True
+
+        self.get_logger().warn("SIM gripper command skipped: no available gripper action server")
+        return False
+
+    def _on_sim_gripper_goal_sent(self, fut, open_gripper: bool):
+        try:
+            gh = fut.result()
+        except Exception as e:
+            self.get_logger().error(f"SIM gripper send failed: {e}")
+            return
+
+        if gh is None or not gh.accepted:
+            action = "open" if open_gripper else "close"
+            self.get_logger().warn(f"SIM gripper goal rejected ({action})")
+            return
+
+        gh.get_result_async().add_done_callback(self._on_sim_gripper_done)
+
+    def _on_sim_gripper_done(self, fut):
+        try:
+            result = fut.result().result
+        except Exception as e:
+            self.get_logger().warn(f"SIM gripper result error: {e}")
+            return
+
+        if hasattr(result, "stalled") and result.stalled:
+            self.get_logger().info("SIM gripper reached stall condition")
 
     # =========================================================
     # HW -> joint_states
@@ -486,14 +583,22 @@ class ArmWorker(Node):
         # ✅ 保证直线下抓：pick 的 step1 使用 Pilz LIN（保持第一版）
         pipeline_id = None
         planner_id = None
-        if self._task.mode == "pick" and self._step_idx == 1:
-            pipeline_id = self.pilz_pipeline_id
-            planner_id = self.pilz_lin_planner_id
+        goal_box_m = None
+        if self._task.mode == "pick":
+            # step0 先把 x/y 收紧到目标点正上方，减少 step1 横向修正
+            if self._step_idx == 0:
+                goal_box_m = self.pick_pregrasp_box_m
+            # step1 使用 Pilz LIN 下抓，并进一步收紧目标容差，尽量保证纯竖直下移
+            elif self._step_idx == 1:
+                pipeline_id = self.pilz_pipeline_id
+                planner_id = self.pilz_lin_planner_id
+                goal_box_m = self.pick_down_box_m
 
         req = self._build_plan_request_with_start_state(
             x, y, z,
             pipeline_id=pipeline_id,
             planner_id=planner_id,
+            goal_box_m=goal_box_m,
         )
         self.plan_cli.call_async(req).add_done_callback(lambda f: self._on_plan_done(f, token))
 
@@ -750,6 +855,7 @@ class ArmWorker(Node):
         *,
         pipeline_id=None,
         planner_id=None,
+        goal_box_m=None,
     ) -> GetMotionPlan.Request:
         pose = PoseStamped()
         pose.header.frame_id = self.base_frame
@@ -794,7 +900,10 @@ class ArmWorker(Node):
 
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
-        box_size = self.pos_box_m_lin if planner_id == "LIN" else self.pos_box_m
+        if goal_box_m is None:
+            box_size = self.pos_box_m_lin if planner_id == "LIN" else self.pos_box_m
+        else:
+            box_size = float(goal_box_m)
         box.dimensions = [box_size, box_size, box_size]
 
         bv = BoundingVolume()

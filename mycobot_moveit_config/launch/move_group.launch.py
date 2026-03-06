@@ -75,6 +75,7 @@ def generate_launch_description():
         srdf_model_path = os.path.join(config_path, f"{robot_name_str}.srdf")
         moveit_controllers_file_path = os.path.join(config_path, "moveit_controllers.yaml")
         pilz_cartesian_limits_file_path = os.path.join(config_path, "pilz_cartesian_limits.yaml")
+        ros2_controllers_file_path = os.path.join(config_path, "ros2_controllers.yaml")
 
         # URDF/XACRO from mycobot_description
         urdf_xacro_path = os.path.join(
@@ -122,6 +123,39 @@ def generate_launch_description():
                 moveit_config.robot_description,
                 {"use_sim_time": use_sim_time},
             ],
+        )
+
+        # ros2_control + controllers（仿真/Mock 执行与夹爪动作可视化都依赖它）
+        control_node = Node(
+            package="controller_manager",
+            executable="ros2_control_node",
+            output="screen",
+            parameters=[
+                moveit_config.robot_description,
+                ros2_controllers_file_path,
+                {"use_sim_time": use_sim_time},
+            ],
+        )
+
+        joint_state_broadcaster_spawner = Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager", "--controller-manager-timeout", "120"],
+            output="screen",
+        )
+
+        arm_controller_spawner = Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=["arm_controller", "--controller-manager", "/controller_manager", "--controller-manager-timeout", "120"],
+            output="screen",
+        )
+
+        gripper_controller_spawner = Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=["gripper_action_controller", "--controller-manager", "/controller_manager", "--controller-manager-timeout", "120"],
+            output="screen",
         )
 
         # MoveIt capabilities（保持你原来的）
@@ -174,7 +208,16 @@ def generate_launch_description():
             ),
         )
 
-        return [rsp_node, start_move_group_node_cmd, start_rviz_node_cmd, exit_event_handler]
+        return [
+            rsp_node,
+            control_node,
+            joint_state_broadcaster_spawner,
+            arm_controller_spawner,
+            gripper_controller_spawner,
+            start_move_group_node_cmd,
+            start_rviz_node_cmd,
+            exit_event_handler,
+        ]
 
     # LaunchDescription
     ld = LaunchDescription()
