@@ -72,7 +72,6 @@ def _extract_joint_index(name: str):
     if not nums:
         return None
 
-
     # 对于 link1_to_link2 这类命名，第一段数字才是关节序号。
     # 取最后一段会把 link1_to_link2 误判成 joint2，导致真机关节映射错位。
     return int(nums[0])
@@ -91,6 +90,12 @@ class Task:
     y: float
     z: float
     retries_left: int = 1  # 抓取失败：从 home 重试一次（默认 1 次）
+    # ================= 移植：新增目标旋转角属性 =================
+    target_rz: float = None 
+    # ============================================================
+    # ================= 0311修改：增加正方体大小属性 =================
+    size: str = "big" 
+    # ================================================================
 
 
 class ArmWorker(Node):
@@ -156,8 +161,15 @@ class ArmWorker(Node):
         self.gripper_cmd_speed = 50
         self.gripper_open_value = 100
         self.gripper_close_value = 5
-        self.gripper_verify_tol = 20
+        self.gripper_verify_tol = 20 
         self.gripper_retries = 3
+
+        # ================= 0311修改：配置不同大小对应的预闭合夹爪数值 =================
+        # 数值 0 为完全闭合，100 为完全张开。
+        # 2.8cm (big) 和 1.8cm (small) 对应的夹爪读数，请根据真机实际情况微调
+        self.gripper_pre_close_big_val = 55   
+        self.gripper_pre_close_small_val = 35 
+        # ==============================================================================
 
         # 仿真 GripperActionController 的关节位置（需落在 URDF 关节限位内）
         self.sim_gripper_open_pos = 0.15
@@ -165,13 +177,19 @@ class ArmWorker(Node):
 
         # 抓取即时判定 + 重试节奏
         self.grasp_check_delay_sec = 0.35
-        self.grasp_success_min_value = 35
+        self.grasp_success_min_value = 5
         self.grasp_retry_pause_sec = 0.4
 
         # ---------------- 掉落检测（保留第二版逻辑） ----------------
-        self.gripper_monitor_period = 0.5
-        self.gripper_drop_threshold = 30
+        self.gripper_monitor_period = 1 #0306修改：掉落检测频率为每秒一次
+        self.gripper_drop_threshold = 10
         self._gripper_monitor_timer = None
+
+        # ================= 移植：✅ 0225新增：定义机械臂 XYZ 坐标的物理极限范围 (单位: mm) =================
+        self.limit_x_min, self.limit_x_max = -281.45, 281.45
+        self.limit_y_min, self.limit_y_max = -281.45, 281.45
+        self.limit_z_min, self.limit_z_max = -70.0, 412.67
+        # ====================================================================
 
         # ---------------- ROS ----------------
         self.plan_cli = self.create_client(GetMotionPlan, "/plan_kinematic_path")
@@ -179,7 +197,13 @@ class ArmWorker(Node):
         self.gripper_ac = ActionClient(self, GripperCommand, "/gripper_action_controller/gripper_cmd")
         self.gripper_traj_ac = ActionClient(self, FollowJointTrajectory, "/gripper_action_controller/follow_joint_trajectory")
         self.gripper_traj_ac_legacy = ActionClient(self, FollowJointTrajectory, "/gripper_controller/follow_joint_trajectory")
+        
         self.sub = self.create_subscription(String, "arm_command", self.command_callback, 10)
+        
+        # ================= 移植：✅ 0225新增：创建发布者，用于向发送指令的节点发送报错/超限信息 =================
+        self.feedback_pub = self.create_publisher(String, "arm_feedback", 10)
+        # ====================================================================
+        
         self.js_pub = self.create_publisher(JointState, "/joint_states", 10)
 
         # joint mapping (MoveIt -> HW)
@@ -255,6 +279,51 @@ class ArmWorker(Node):
     def _is_busy(self) -> bool:
         return self.state in (State.PLAN_EXEC, State.WAIT_PRE, State.HOMING)
 
+    # ====================================================================
+    # ================= 移植：✅ 0225新增：坐标范围拦截与反馈器函数 =================
+    # ====================================================================
+    def _check_limits_and_feedback(self, x, y, z) -> bool:
+        """
+        检查目标坐标是否超出机械臂物理极限，如果超限则发布消息说明具体超出的轴和数值。
+        返回 True 表示安全，返回 False 表示超限拦截。
+        """
+        errors = []
+        
+        # 检查 X 轴
+        if x < self.limit_x_min:
+            errors.append(f"X轴超限(小于下限), 超出了 {self.limit_x_min - x:.2f} mm")
+        elif x > self.limit_x_max:
+            errors.append(f"X轴超限(大于上限), 超出了 {x - self.limit_x_max:.2f} mm")
+            
+        # 检查 Y 轴
+        if y < self.limit_y_min:
+            errors.append(f"Y轴超限(小于下限), 超出了 {self.limit_y_min - y:.2f} mm")
+        elif y > self.limit_y_max:
+            errors.append(f"Y轴超限(大于上限), 超出了 {y - self.limit_y_max:.2f} mm")
+            
+        # 检查 Z 轴
+        if z < self.limit_z_min:
+            errors.append(f"Z轴超限(小于下限), 超出了 {self.limit_z_min - z:.2f} mm")
+        elif z > self.limit_z_max:
+            errors.append(f"Z轴超限(大于上限), 超出了 {z - self.limit_z_max:.2f} mm")
+            
+        if errors:
+            # 拼接完整的错误信息
+            error_msg = f"❌ 坐标({x:.1f}, {y:.1f}, {z:.1f})不合法: " + "; ".join(errors)
+            
+            # 在本地终端打印红字报警
+            self.get_logger().error(error_msg)
+            
+            # 通过 ROS 话题把报警信息发送给调用者
+            msg = String()
+            msg.data = error_msg
+            self.feedback_pub.publish(msg)
+            
+            return False # 拦截，不安全
+            
+        return True # 安全
+    # ====================================================================
+
     # =========================================================
     # 掉落检测（后台）
     # =========================================================
@@ -264,12 +333,30 @@ class ArmWorker(Node):
         if self._is_busy():
             return
         try:
+            # =======================================================
+            # ✅ 0306 新增修改：主动保压机制 (Active Clamping)
+            # 每隔 0.5s，用很低的速度(如 15) 再次下发闭合指令。
+            # 如果物体掉了，这个指令会立刻让空夹爪完全闭合。
+            self.mc.set_gripper_value(self.gripper_close_value, 15)
+            # 给出 0.4 秒的物理响应时间让夹爪动一动
+            time.sleep(0.4) 
+            # =======================================================
             v = self.mc.get_gripper_value()
             if v is None:
                 return
             if v < self.gripper_drop_threshold:
                 self.get_logger().warn(f"🚨 警报：疑似掉落！夹爪值={v} < {self.gripper_drop_threshold}")
                 self.has_object = False
+                # ================= ✅ 0306新增修改：掉落后自动恢复 =================
+                self.get_logger().warn("🔄 触发掉落保护：立刻张开夹爪并返回 Home 位置...")
+                
+                # 步骤 A：立刻强行张开夹爪，防止夹爪钩拽住半掉落的物体划伤桌面
+                self._gripper_open()
+                # 步骤 B：清空可能还在排队等待的其它指令，防止发生动作逻辑混乱
+                self._queue.clear()
+                # 步骤 C：调用回零函数，让机械臂安全退回全部为 0 度的初始姿态
+                self._enter_home()
+                
                 self.get_logger().warn("🔄 has_object=False，等待下一条指令（或重新 pick）")
         except Exception as e:
             self.get_logger().error(f"掉落监测读取失败: {e}")
@@ -393,6 +480,7 @@ class ArmWorker(Node):
 
         self.get_logger().info(f"✅ 抓取成功：夹爪值={v} > {self.grasp_success_min_value}")
         return True
+
     def _gripper_sim(self, *, open_gripper: bool) -> bool:
         target = self.sim_gripper_open_pos if open_gripper else self.sim_gripper_close_pos
         action = "open" if open_gripper else "close"
@@ -513,25 +601,140 @@ class ArmWorker(Node):
             return
 
         parts = cmd.split()
-        if len(parts) != 4:
-            self.get_logger().error("格式: pick x y z (mm) | place x y z (mm) | home")
+        if len(parts) == 0:
             return
 
         mode = parts[0]
+        
+        # ================= 移植：1. 模式合法性统一拦截 =================
         if mode not in ("pick", "place"):
-            self.get_logger().error("模式必须是 pick 或 place")
+            self.get_logger().error("❌ 模式必须是 pick 或 place")
             return
 
-        try:
-            x = float(parts[1])
-            y = float(parts[2])
-            z = float(parts[3])
-        except ValueError:
-            self.get_logger().error("x y z 必须是数字(mm)")
+        if mode == "pick":
+            # ================= 0311修改：将长短边输入注释掉，恢复直接输入 xyz 坐标 =================
+            '''
+            if len(parts) != 10:
+                self.get_logger().error("格式: pick x1 y1 x2 y2 x3 y3 x4 y4 z")
+                return
+            try:
+                p1 = [float(parts[1]), float(parts[2])]
+                p2 = [float(parts[3]), float(parts[4])]
+                p3 = [float(parts[5]), float(parts[6])]
+                p4 = [float(parts[7]), float(parts[8])]
+                z = float(parts[9])
+            except ValueError:
+                self.get_logger().error("坐标必须是数字")
+                return
+            '''
+            
+            # ================= 0311修改：增加正方体大小：big/small =================
+            if len(parts) != 5:
+                self.get_logger().error("❌ 0311修改: 格式错误! pick 需要 4 个参数: size x y z (例如: pick big 150 0 20)")
+                return
+            
+            size_str = parts[1].lower()
+            if size_str not in ("big", "small"):
+                self.get_logger().error("❌ 0311修改: 正方体大小必须是 big 或 small")
+                return
+
+            try:
+                cx = float(parts[2])
+                cy = float(parts[3])
+                z = float(parts[4])
+            # =======================================================================
+            except ValueError:
+                self.get_logger().error("坐标必须是数字")
+                return
+
+            OFFSET_X = 150.0  
+            OFFSET_Y = -200.0 
+            OFFSET_Z = 20.0   
+            
+            # ================= 0311修改：不再计算四个角点，直接对输入的质心坐标进行补偿 =================
+            '''
+            p1[0] += OFFSET_X; p1[1] += OFFSET_Y
+            p2[0] += OFFSET_X; p2[1] += OFFSET_Y
+            p3[0] += OFFSET_X; p3[1] += OFFSET_Y
+            p4[0] += OFFSET_X; p4[1] += OFFSET_Y
+            z += OFFSET_Z
+            # 1. 算质心
+            cx = (p1[0] + p2[0] + p3[0] + p4[0]) / 4.0
+            cy = (p1[1] + p2[1] + p3[1] + p4[1]) / 4.0
+            '''
+            cx += OFFSET_X
+            cy += OFFSET_Y
+            z += OFFSET_Z
+
+            # ✅ 0225新增：在抓取前，检查经过 OFFSET 补偿后的质心是否超限
+            if not self._check_limits_and_feedback(cx, cy, z):
+                return # 如果超限，函数 _check_limits_and_feedback 已经发布了报警消息，这里直接终止任务
+            
+            # ================= 0311修改：不需要进行长短边判断和旋转了，注释掉角度计算 =================
+            '''
+            # 2. 区分长短边并算角度
+            l12 = math.dist(p1, p2)
+            l23 = math.dist(p2, p3)
+            
+            if l12 < l23:
+                angle_rad = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+            else:
+                angle_rad = math.atan2(p3[1] - p2[1], p3[0] - p2[0])
+                
+            gripper_angle = math.degrees(angle_rad)
+            
+            if gripper_angle > 90:
+                gripper_angle -= 180
+            elif gripper_angle < -90:
+                gripper_angle += 180
+                
+            j6_angle = gripper_angle - 45.0
+            
+            if j6_angle > 180:
+                j6_angle -= 360
+            elif j6_angle < -180:
+                j6_angle += 360
+            '''
+            
+            # ================= 0311修改：只需要抓取正方体方块，不旋转 =================
+            j6_angle = None 
+            
+            self.get_logger().info(f"🧠 输入质心抓取({cx:.1f},{cy:.1f}), 物体大小: {size_str}")
+            
+            # ================= 0311修改：任务增加 size 属性 =================
+            self._queue.append(Task("pick", cx, cy, z, retries_left=1, target_rz=j6_angle, size=size_str))
+            # ================================================================
             return
 
-        # 每条新指令：默认允许 1 次抓取失败重试（只对 pick 有意义）
-        self._queue.append(Task(mode, x, y, z, retries_left=1))
+        # ================= 移植：新增：独立的 place 逻辑(目前不补偿相机偏置，为机械臂坐标系) =================
+        elif mode == "place":
+            if len(parts) != 4:
+                self.get_logger().error("❌ 格式错误! place 需要 3 个数值: x y z")
+                return
+                
+            try:
+                x = float(parts[1])
+                y = float(parts[2])
+                z = float(parts[3])
+            except ValueError:
+                self.get_logger().error("❌ 坐标必须是数字")
+                return
+            # ✅  0225新增：纯平移坐标系校正 (Camera XYZ -> Robot XYZ)
+            '''根据实际安装的摄像头位置和机械臂基座位置，进行一个固定的坐标偏移校正。
+            OFFSET_X = 150.0  
+            OFFSET_Y = -200.0 
+            OFFSET_Z = 20.0   
+            
+            x += OFFSET_X
+            y += OFFSET_Y
+            z += OFFSET_Z
+            '''
+            # ✅ 0225新增：放置指令同样需要检查是否超出机械臂物理界限
+            if not self._check_limits_and_feedback(x, y, z):
+                return
+
+            self._queue.append(Task("place", x, y, z, retries_left=1, target_rz=None))
+        return 
 
     # =========================================================
     # Tick / FSM
@@ -668,7 +871,7 @@ class ArmWorker(Node):
 
     def _on_step_finished(self):
         idx = self._step_idx
-        self.get_logger().info(f"✅ step[{idx}] finished")
+        self.get_logger().info(f"step[{idx}] finished")
 
         # pick：到预抓取点后等待，再下抓
         if self._task and self._task.mode == "pick" and idx == 0:
@@ -676,26 +879,68 @@ class ArmWorker(Node):
             self._token += 1
             token = self._token
             self._cancel_wait_timer()
-            self.get_logger().info(f"到达预抓取，停顿 {self.pregrasp_wait_sec:.1f}s 后下抓")
+
+            # ================= 移植：到达预抓取高度，原地执行旋转 =================
+            if self.mc and self._task.target_rz is not None:
+                self.get_logger().info(f"🔄 到达预抓取高度，原地执行旋转... J6目标={self._task.target_rz:.1f}°")
+                self.mc.send_angle(6, self._task.target_rz, 50)
+            # ====================================================================
+
+            # ================= 0311修改：夹爪在物体上方停留时，根据物体大小进行预先闭合 =================
+            if self.mc:
+                if self._task.size == "big":
+                    self.get_logger().info("🔄 0311修改：识别为 big，预闭合夹爪至 2.8cm")
+                    self.mc.set_gripper_value(self.gripper_pre_close_big_val, self.gripper_cmd_speed)
+                elif self._task.size == "small":
+                    self.get_logger().info("🔄 0311修改：识别为 small，预闭合夹爪至 1.8cm")
+                    self.mc.set_gripper_value(self.gripper_pre_close_small_val, self.gripper_cmd_speed)
+            # ==========================================================================================
+
+            self.get_logger().info(f"到达预抓取，停顿 {self.pregrasp_wait_sec:.1f}s 后下抓 (在此期间完成硬件旋转/预闭合)")
             self._wait_timer = self.create_timer(self.pregrasp_wait_sec, lambda: self._on_wait_done(token))
             return
 
         # step1 到目标点：pick / place 的末端动作
         if self._task and idx == 1:
             if self._task.mode == "pick":
+                # ================= 0311修改：夹爪下探到物体位置时，顺时针旋转10度 =================
+                j6_original = None
+                if self.mc:
+                    self.get_logger().info("🔄 0311修改：已下探到位，顺时针旋转 10 度...")
+                    try:
+                        curr_angles = self.mc.get_angles()
+                        if curr_angles and len(curr_angles) >= 6:
+                            j6_original = curr_angles[5]  # 记录当前第六关节的角度
+                            target_j6 = j6_original - 10.0 # 顺时针旋转 10度
+                            self.mc.send_angle(6, target_j6, 50)
+                            time.sleep(0.5) # 给定 0.5 秒等待舵机旋转动作完成
+                    except Exception as e:
+                        self.get_logger().error(f"0311修改: 旋转10度失败: {e}")
+                # ==================================================================================
+
                 self.get_logger().info("夹爪闭合：抓取")
                 self._gripper_close()
 
                 ok = self._verify_grasp_now()
                 self.has_object = bool(ok)
 
+                # ================= 0311修改：完成夹取后，夹爪旋转角度回复到初始位置 =================
+                if self.mc and j6_original is not None:
+                    self.get_logger().info("🔄 0311修改：完成夹取，夹爪旋转角度回复到初始位置...")
+                    try:
+                        self.mc.send_angle(6, j6_original, 50)
+                        time.sleep(0.5) # 给定 0.5 秒让夹爪原位转回
+                    except Exception as e:
+                        pass
+                # ====================================================================================
+
                 if ok:
-                    self.get_logger().info("✅ 抓取成功，回 Home")
+                    self.get_logger().info("抓取成功，回 Home")
                     self._enter_home()
                     return
 
                 # 失败：从 home 重试一次（保留第二版 E）
-                self.get_logger().warn("🔁 抓取失败：将从 Home 重新尝试同一抓取点（1 次）")
+                self.get_logger().warn("抓取失败：将从 Home 重新尝试同一抓取点（1 次）")
 
                 # 失败时务必开爪（保证下一轮从 home 开始夹爪张开）
                 self._gripper_open()
@@ -708,6 +953,12 @@ class ArmWorker(Node):
                         y=self._task.y,
                         z=self._task.z,
                         retries_left=self._task.retries_left - 1,
+                        # ================= 移植：重试时保留旋转角 =================
+                        target_rz=self._task.target_rz,
+                        # ==========================================================
+                        # ================= 0311修改：重试时保留正方体大小 =================
+                        size=self._task.size
+                        # ==================================================================
                     )
 
                     time.sleep(float(self.grasp_retry_pause_sec))
