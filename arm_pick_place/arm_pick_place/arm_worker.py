@@ -71,9 +71,6 @@ def _extract_joint_index(name: str):
     nums = re.findall(r"\d+", name)
     if not nums:
         return None
-
-    # 对于 link1_to_link2 这类命名，第一段数字才是关节序号。
-    # 取最后一段会把 link1_to_link2 误判成 joint2，导致真机关节映射错位。
     return int(nums[0])
 
 class State(Enum):
@@ -81,6 +78,7 @@ class State(Enum):
     PLAN_EXEC = auto()
     WAIT_PRE = auto()
     HOMING = auto()
+
 
 
 @dataclass
@@ -96,6 +94,9 @@ class Task:
     # ================= 0311修改：增加正方体大小属性 =================
     size: str = "big" 
     # ================================================================
+    # 当夹爪闭合后读数落在该区间[min,max]时，触发松开+旋转45°再抓取
+    regrasp_trigger_value: tuple = None
+
 
 
 class ArmWorker(Node):
@@ -109,7 +110,7 @@ class ArmWorker(Node):
         # ---------------- MoveIt (保持第一版命名) ----------------
         self.group_name = "arm"
         self.ee_link = "tcp"
-        self.base_frame = "base_link"  # REP-103: x前 y左 z上
+        self.base_frame = "base_link"  # REP-103: x左 y前 z上
         self.allowed_planning_time = 8.0
         self.num_planning_attempts = 20
         self.max_vel_scale = 0.15
@@ -118,16 +119,15 @@ class ArmWorker(Node):
         # OMPL vs LIN position box
         # Position constraint box
         self.pos_box_m = 0.03
-        self.pos_box_m_lin = 0.001
+        self.pos_box_m_lin = 0.0001
+        
         # pick 任务为了避免横向漂移，收紧 pregrasp 与下抓目标容差
-        self.pick_pregrasp_box_m = 0.001
-        self.pick_down_box_m = 0.0002
+        self.pick_pregrasp_box_m = 0.0001
+        self.pick_down_box_m = 0.00001
+        self.place_goal_box_m = 0.0003
+        self.place_down_box_m = 0.0002
 
         # ---------------- 末端约束：tcp +Y 对齐 base -Z（保持第一版） ----------------
-        # 选择 R = RotX(-90deg)：
-        #   tcp +Y -> base -Z
-        #   tcp +X -> base +X
-        #   tcp +Z -> base +Y
         self.ee_roll_deg = -90.0
         self.ee_pitch_deg = 0.0
         self.ee_yaw_deg = 0.0
@@ -140,10 +140,11 @@ class ArmWorker(Node):
         # ---------------- Pilz LIN（保证垂直直线下抓） ----------------
         self.pilz_pipeline_id = "pilz_industrial_motion_planner"
         self.pilz_lin_planner_id = "LIN"
-
+        
         # ---------------- Behavior ----------------
         self.pregrasp_offset_mm = 30.0
         self.pregrasp_wait_sec = 3.0
+        self.place_settle_sec = 0.25
 
         # ---------------- Home ----------------
         self.home_angles_deg = [0, 0, 0, 0, 0, 0]
@@ -156,6 +157,7 @@ class ArmWorker(Node):
         self.hw_rate_hz = 190.0
         self.hw_time_scale = 0.2
         self.hw_send_speed = 12
+        self.hw_exec_settle_timeout_sec = 1.2
 
         # ---------------- Gripper ----------------
         self.gripper_cmd_speed = 50
@@ -164,12 +166,29 @@ class ArmWorker(Node):
         self.gripper_verify_tol = 20 
         self.gripper_retries = 3
 
-        # ================= 0311修改：配置不同大小对应的预闭合夹爪数值 =================
-        # 数值 0 为完全闭合，100 为完全张开。
-        # 2.8cm (big) 和 1.8cm (small) 对应的夹爪读数，请根据真机实际情况微调
-        self.gripper_pre_close_big_val = 55   
-        self.gripper_pre_close_small_val = 35 
-        # ==============================================================================
+
+        # 二次抓取前：要求夹爪更充分张开再旋转，避免带着物体一起转
+        self.regrasp_open_full_tol = 5
+        self.regrasp_open_confirm_wait_sec = 0.25
+
+        # pick big/small 对应“二次抓取触发区间”（闭合后读数落在区间内时触发）
+        self.regrasp_trigger_big_range = (70, 82)
+        self.regrasp_trigger_small_range = (35, 45)
+
+        # 大/小正方体：边长抓取与对角抓取时的典型夹爪读数（用于动态映射旋转角）
+        self.grasp_profile = {
+            "big": {"edge": 50, "diag": 78},
+            "small": {"edge": 29, "diag": 42},
+        }
+        self.regrasp_max_rotate_deg = 45.0
+        self.regrasp_loop_max_attempts = 3
+        # 闭合值接近“边长抓取”时不旋转的容差
+        self.regrasp_edge_no_rotate_tol = 5
+        # 兼容旧字段名（历史版本曾使用 *_value 单点触发）
+        self.regrasp_trigger_big_value = 79
+        self.regrasp_trigger_small_value = 41
+
+
 
         # 仿真 GripperActionController 的关节位置（需落在 URDF 关节限位内）
         self.sim_gripper_open_pos = 0.15
@@ -200,7 +219,7 @@ class ArmWorker(Node):
         
         self.sub = self.create_subscription(String, "arm_command", self.command_callback, 10)
         
-        # ================= 移植：✅ 0225新增：创建发布者，用于向发送指令的节点发送报错/超限信息 =================
+        # ================= 移植：0225新增：创建发布者，用于向发送指令的节点发送报错/超限信息 =================
         self.feedback_pub = self.create_publisher(String, "arm_feedback", 10)
         # ====================================================================
         
@@ -230,7 +249,7 @@ class ArmWorker(Node):
         self._step_idx = 0
         self._token = 0
         self._wait_timer = None
-
+        self._place_step1_fallback_used = False
         # ---------------- Connect HW ----------------
         try:
             self.mc = MyCobot280(self.port, self.baud)
@@ -509,7 +528,6 @@ class ArmWorker(Node):
             pt.time_from_start.sec = 0
             pt.time_from_start.nanosec = int(0.5 * 1e9)
             traj.points = [pt]
-
             goal = FollowJointTrajectory.Goal()
             goal.trajectory = traj
             self.get_logger().info(f"SIM gripper {action} (JointTrajectory): position={target:.3f}")
@@ -586,9 +604,7 @@ class ArmWorker(Node):
         self.get_logger().info(f"✅ MoveIt->HW map: {self._moveit_name_to_hw_idx}")
         return True
 
-    # =========================================================
     # Command
-    # =========================================================
     def command_callback(self, msg: String):
         s = msg.data.strip()
         cmd = s.lower()
@@ -608,26 +624,10 @@ class ArmWorker(Node):
         
         # ================= 移植：1. 模式合法性统一拦截 =================
         if mode not in ("pick", "place"):
-            self.get_logger().error("❌ 模式必须是 pick 或 place")
+            self.get_logger().error("模式必须是 pick 或 place")
             return
 
         if mode == "pick":
-            # ================= 0311修改：将长短边输入注释掉，恢复直接输入 xyz 坐标 =================
-            '''
-            if len(parts) != 10:
-                self.get_logger().error("格式: pick x1 y1 x2 y2 x3 y3 x4 y4 z")
-                return
-            try:
-                p1 = [float(parts[1]), float(parts[2])]
-                p2 = [float(parts[3]), float(parts[4])]
-                p3 = [float(parts[5]), float(parts[6])]
-                p4 = [float(parts[7]), float(parts[8])]
-                z = float(parts[9])
-            except ValueError:
-                self.get_logger().error("坐标必须是数字")
-                return
-            '''
-            
             # ================= 0311修改：增加正方体大小：big/small =================
             if len(parts) != 5:
                 self.get_logger().error("❌ 0311修改: 格式错误! pick 需要 4 个参数: size x y z (例如: pick big 150 0 20)")
@@ -647,21 +647,11 @@ class ArmWorker(Node):
                 self.get_logger().error("坐标必须是数字")
                 return
 
-            OFFSET_X = 150.0  
-            OFFSET_Y = -200.0 
-            OFFSET_Z = 20.0   
+            OFFSET_X = 0.0  
+            OFFSET_Y = 0 
+            OFFSET_Z = 0   
             
-            # ================= 0311修改：不再计算四个角点，直接对输入的质心坐标进行补偿 =================
-            '''
-            p1[0] += OFFSET_X; p1[1] += OFFSET_Y
-            p2[0] += OFFSET_X; p2[1] += OFFSET_Y
-            p3[0] += OFFSET_X; p3[1] += OFFSET_Y
-            p4[0] += OFFSET_X; p4[1] += OFFSET_Y
-            z += OFFSET_Z
-            # 1. 算质心
-            cx = (p1[0] + p2[0] + p3[0] + p4[0]) / 4.0
-            cy = (p1[1] + p2[1] + p3[1] + p4[1]) / 4.0
-            '''
+
             cx += OFFSET_X
             cy += OFFSET_Y
             z += OFFSET_Z
@@ -670,39 +660,26 @@ class ArmWorker(Node):
             if not self._check_limits_and_feedback(cx, cy, z):
                 return # 如果超限，函数 _check_limits_and_feedback 已经发布了报警消息，这里直接终止任务
             
-            # ================= 0311修改：不需要进行长短边判断和旋转了，注释掉角度计算 =================
-            '''
-            # 2. 区分长短边并算角度
-            l12 = math.dist(p1, p2)
-            l23 = math.dist(p2, p3)
-            
-            if l12 < l23:
-                angle_rad = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
-            else:
-                angle_rad = math.atan2(p3[1] - p2[1], p3[0] - p2[0])
-                
-            gripper_angle = math.degrees(angle_rad)
-            
-            if gripper_angle > 90:
-                gripper_angle -= 180
-            elif gripper_angle < -90:
-                gripper_angle += 180
-                
-            j6_angle = gripper_angle - 45.0
-            
-            if j6_angle > 180:
-                j6_angle -= 360
-            elif j6_angle < -180:
-                j6_angle += 360
-            '''
-            
             # ================= 0311修改：只需要抓取正方体方块，不旋转 =================
             j6_angle = None 
             
-            self.get_logger().info(f"🧠 输入质心抓取({cx:.1f},{cy:.1f}), 物体大小: {size_str}")
-            
+            regrasp_trigger_value = (
+                self.regrasp_trigger_big_range if size_str == "big" else self.regrasp_trigger_small_range
+            )
+
+            self.get_logger().info(
+                f"🧠 输入质心抓取({cx:.1f},{cy:.1f}), 物体大小: {size_str}, 二次抓取触发区间={regrasp_trigger_value}"
+            )
             # ================= 0311修改：任务增加 size 属性 =================
-            self._queue.append(Task("pick", cx, cy, z, retries_left=1, target_rz=j6_angle, size=size_str))
+            self._queue.append(
+                Task(
+                    "pick", cx, cy, z,
+                    retries_left=1,
+                    target_rz=j6_angle,
+                    size=size_str,
+                    regrasp_trigger_value=regrasp_trigger_value,
+                )
+            )
             # ================================================================
             return
 
@@ -719,6 +696,9 @@ class ArmWorker(Node):
             except ValueError:
                 self.get_logger().error("❌ 坐标必须是数字")
                 return
+            
+            OFFSET_Z = 30.0
+            z += OFFSET_Z
             # ✅  0225新增：纯平移坐标系校正 (Camera XYZ -> Robot XYZ)
             '''根据实际安装的摄像头位置和机械臂基座位置，进行一个固定的坐标偏移校正。
             OFFSET_X = 150.0  
@@ -764,6 +744,7 @@ class ArmWorker(Node):
         self._task = t
         self._steps = [(t.x, t.y, pre_z), (t.x, t.y, t.z)]
         self._step_idx = 0
+        self._place_step1_fallback_used = False
         self._start_step()
 
     def _start_step(self):
@@ -774,11 +755,12 @@ class ArmWorker(Node):
         if self._step_idx >= len(self._steps):
             self._enter_home()
             return
+        if self._task.mode != "place" or self._step_idx != 1:
+            self._place_step1_fallback_used = False
 
         self.state = State.PLAN_EXEC
         self._token += 1
         token = self._token
-
         x, y, z = self._steps[self._step_idx]
         self.get_logger().info(f"Planning step[{self._step_idx}] -> ({x:.1f},{y:.1f},{z:.1f}) mm")
 
@@ -787,6 +769,10 @@ class ArmWorker(Node):
         planner_id = None
         goal_box_m = None
         if self._task.mode == "pick":
+            # pick 过程移动时保持夹爪最大张开，直到到达抓取位才闭合
+            if self._step_idx in (0, 1):
+                self._gripper_open()
+
             # step0 先把 x/y 收紧到目标点正上方，减少 step1 横向修正
             if self._step_idx == 0:
                 goal_box_m = self.pick_pregrasp_box_m
@@ -795,6 +781,13 @@ class ArmWorker(Node):
                 pipeline_id = self.pilz_pipeline_id
                 planner_id = self.pilz_lin_planner_id
                 goal_box_m = self.pick_down_box_m
+        elif self._task.mode == "place":
+            if self._step_idx == 1 and (not self._place_step1_fallback_used):
+                pipeline_id = self.pilz_pipeline_id
+                planner_id = self.pilz_lin_planner_id
+                goal_box_m = self.place_down_box_m
+            else:
+                goal_box_m = self.place_goal_box_m
 
         req = self._build_plan_request_with_start_state(
             x, y, z,
@@ -810,21 +803,28 @@ class ArmWorker(Node):
         try:
             result = fut.result()
         except Exception as e:
-            self.get_logger().error(f"planning exception: {e}")
-            self._reset()
+            self._handle_runtime_error(f"planning exception: {e}")
             return
 
         res = result.motion_plan_response
         code = res.error_code.val
         if code != MoveItErrorCodes.SUCCESS:
-            self.get_logger().error(f"planning failed: {moveit_error_to_str(code)} ({code})")
-            self._reset()
+            if self._task and self._task.mode == "place" and self._step_idx == 1 and (not self._place_step1_fallback_used):
+                self._place_step1_fallback_used = True
+                self.get_logger().warn(
+                    f"place step1 使用 LIN 规划失败: {moveit_error_to_str(code)} ({code})，改用 OMPL 回退重试一次"
+                )
+                self.state = State.IDLE
+                self._start_step()
+                return
+
+            self._handle_runtime_error(f"planning failed: {moveit_error_to_str(code)} ({code})")
             return
+
 
         traj = res.trajectory.joint_trajectory
         if (not traj.joint_names) or (len(traj.points) == 0):
-            self.get_logger().error("planning returned empty trajectory")
-            self._reset()
+            self._handle_runtime_error("planning returned empty trajectory")
             return
 
         if self.mc and self.moveit_joint_names is None:
@@ -836,7 +836,7 @@ class ArmWorker(Node):
         if self.mc:
             ok = self._exec_hw_smooth_interpolated(traj)
             if not ok:
-                self._reset()
+                self._handle_runtime_error("hardware trajectory execution failed")
                 return
             self._on_step_finished()
         else:
@@ -849,8 +849,7 @@ class ArmWorker(Node):
             return
         gh = fut.result()
         if gh is None or not gh.accepted:
-            self.get_logger().error("controller rejected goal")
-            self._reset()
+            self._handle_runtime_error("controller rejected goal")
             return
         gh.get_result_async().add_done_callback(lambda f: self._on_sim_done(f, token))
 
@@ -860,12 +859,10 @@ class ArmWorker(Node):
         try:
             result = fut.result().result
             if hasattr(result, "error_code") and int(result.error_code) != 0:
-                self.get_logger().error(f"sim controller error_code={int(result.error_code)}")
-                self._reset()
+                self._handle_runtime_error(f"sim controller error_code={int(result.error_code)}")
                 return
         except Exception as e:
-            self.get_logger().error(f"sim result exception: {e}")
-            self._reset()
+            self._handle_runtime_error(f"sim result exception: {e}")
             return
         self._on_step_finished()
 
@@ -879,60 +876,52 @@ class ArmWorker(Node):
             self._token += 1
             token = self._token
             self._cancel_wait_timer()
-
-            # ================= 移植：到达预抓取高度，原地执行旋转 =================
-            if self.mc and self._task.target_rz is not None:
-                self.get_logger().info(f"🔄 到达预抓取高度，原地执行旋转... J6目标={self._task.target_rz:.1f}°")
-                self.mc.send_angle(6, self._task.target_rz, 50)
-            # ====================================================================
-
-            # ================= 0311修改：夹爪在物体上方停留时，根据物体大小进行预先闭合 =================
-            if self.mc:
-                if self._task.size == "big":
-                    self.get_logger().info("🔄 0311修改：识别为 big，预闭合夹爪至 2.8cm")
-                    self.mc.set_gripper_value(self.gripper_pre_close_big_val, self.gripper_cmd_speed)
-                elif self._task.size == "small":
-                    self.get_logger().info("🔄 0311修改：识别为 small，预闭合夹爪至 1.8cm")
-                    self.mc.set_gripper_value(self.gripper_pre_close_small_val, self.gripper_cmd_speed)
-            # ==========================================================================================
-
-            self.get_logger().info(f"到达预抓取，停顿 {self.pregrasp_wait_sec:.1f}s 后下抓 (在此期间完成硬件旋转/预闭合)")
+            self.get_logger().info(f"到达预抓取，停顿 {self.pregrasp_wait_sec:.1f}s 后下抓 (移动期间夹爪保持最大张开)")
             self._wait_timer = self.create_timer(self.pregrasp_wait_sec, lambda: self._on_wait_done(token))
             return
 
         # step1 到目标点：pick / place 的末端动作
         if self._task and idx == 1:
             if self._task.mode == "pick":
-                # ================= 0311修改：夹爪下探到物体位置时，顺时针旋转10度 =================
-                j6_original = None
-                if self.mc:
-                    self.get_logger().info("🔄 0311修改：已下探到位，顺时针旋转 10 度...")
-                    try:
-                        curr_angles = self.mc.get_angles()
-                        if curr_angles and len(curr_angles) >= 6:
-                            j6_original = curr_angles[5]  # 记录当前第六关节的角度
-                            target_j6 = j6_original - 10.0 # 顺时针旋转 10度
-                            self.mc.send_angle(6, target_j6, 50)
-                            time.sleep(0.5) # 给定 0.5 秒等待舵机旋转动作完成
-                    except Exception as e:
-                        self.get_logger().error(f"0311修改: 旋转10度失败: {e}")
-                # ==================================================================================
-
                 self.get_logger().info("夹爪闭合：抓取")
                 self._gripper_close()
+
+                # 抓取后始终进行夹爪读数检测：仅当读数约等于边长时不旋转，否则按映射角重抓
+                if self.mc:
+                    try:
+                        for i in range(int(self.regrasp_loop_max_attempts)):
+                            v = self.mc.get_gripper_value()
+                            if v is None:
+                                break
+                            vi = int(v)
+                            rotate_deg = self._compute_regrasp_rotate_deg(self._task.size, vi)
+                            if rotate_deg <= 0.0:
+                                self.get_logger().info(
+                                    f"第{i+1}次检测: 闭合值={vi} 约等于边长抓取值，保持当前姿态直接判定抓取"
+                                )
+                                break
+
+                            self.get_logger().warn(
+                                f"第{i+1}次二次抓取: 闭合值={vi}，先最大张开再旋转{rotate_deg:.1f}°"
+                            )
+                            # 先最大张开（确认到位）再旋转
+                            opened = self._gripper_open_fully_before_regrasp()
+                            if not opened:
+                                self.get_logger().warn("二次抓取：夹爪未充分张开，跳过本次旋转以避免带动物体")
+                                continue
+
+                            curr_angles = self.mc.get_angles()
+                            if curr_angles and len(curr_angles) >= 6:
+                                self.mc.send_angle(6, curr_angles[5] + rotate_deg, 50)
+                                time.sleep(0.5)
+                            self._gripper_close()
+                    except Exception as e:
+
+                        self.get_logger().error(f"二次抓取触发流程失败: {e}")
 
                 ok = self._verify_grasp_now()
                 self.has_object = bool(ok)
 
-                # ================= 0311修改：完成夹取后，夹爪旋转角度回复到初始位置 =================
-                if self.mc and j6_original is not None:
-                    self.get_logger().info("🔄 0311修改：完成夹取，夹爪旋转角度回复到初始位置...")
-                    try:
-                        self.mc.send_angle(6, j6_original, 50)
-                        time.sleep(0.5) # 给定 0.5 秒让夹爪原位转回
-                    except Exception as e:
-                        pass
-                # ====================================================================================
 
                 if ok:
                     self.get_logger().info("抓取成功，回 Home")
@@ -957,8 +946,9 @@ class ArmWorker(Node):
                         target_rz=self._task.target_rz,
                         # ==========================================================
                         # ================= 0311修改：重试时保留正方体大小 =================
-                        size=self._task.size
+                        size=self._task.size,
                         # ==================================================================
+                        regrasp_trigger_value=self._task.regrasp_trigger_value,
                     )
 
                     time.sleep(float(self.grasp_retry_pause_sec))
@@ -981,6 +971,8 @@ class ArmWorker(Node):
                 return
 
             else:
+                if self.mc:
+                    time.sleep(float(self.place_settle_sec))
                 self.get_logger().info("夹爪张开：放置")
                 ok = self._gripper_open()
                 if self.mc:
@@ -1016,6 +1008,52 @@ class ArmWorker(Node):
             except Exception:
                 pass
             self._wait_timer = None
+    
+    def _gripper_open_fully_before_regrasp(self) -> bool:
+        """二次抓取专用：要求夹爪尽量张开到最大值附近再允许旋转。"""
+        ok = self._gripper_open()
+        if not self.mc:
+            return ok
+
+        target_min = int(self.gripper_open_value) - int(self.regrasp_open_full_tol)
+        for _ in range(max(1, int(self.gripper_retries))):
+            try:
+                time.sleep(float(self.regrasp_open_confirm_wait_sec))
+                v = self.mc.get_gripper_value()
+                if v is not None and int(v) >= target_min:
+                    return True
+                # 再次补发开夹指令
+                self._gripper_open()
+            except Exception:
+                pass
+        return False
+
+    def _compute_regrasp_rotate_deg(self, size: str, gripper_value: int) -> float:
+        """根据物体大小与夹爪闭合读数动态计算二次抓取旋转角。
+        仅当读数明显偏离边长抓取值时旋转；越接近对角线值，旋转角越大。
+        """
+        profile = self.grasp_profile.get(size)
+        if not profile:
+            return 0.0
+
+        edge = float(profile["edge"])
+        diag = float(profile["diag"])
+        if diag <= edge:
+            return 0.0
+
+        v = float(gripper_value)
+        if abs(v - edge) <= float(self.regrasp_edge_no_rotate_tol):
+            return 0.0
+
+        ratio = (v - edge) / (diag - edge)
+        ratio = max(0.0, min(1.0, ratio))
+        return float(self.regrasp_max_rotate_deg) * ratio
+
+
+    def _is_near_gripper_min(self, gripper_value: int) -> bool:
+        return abs(int(gripper_value) - int(self.gripper_close_value)) <= int(self.regrasp_near_min_tol)
+
+
 
     # =========================================================
     # HOME（真机/仿真都实现，避免第二版“仿真 home 不动”）
@@ -1033,7 +1071,6 @@ class ArmWorker(Node):
         if not self.mc:
             self._send_home_sim()
             return
-
         self.get_logger().info("🏠 (HW) 回到 Home ...")
         try:
             self.mc.send_angles(self.home_angles_deg, self.home_speed)
@@ -1085,6 +1122,13 @@ class ArmWorker(Node):
         if token != self._token:
             return
         self.state = State.IDLE
+    
+    def _handle_runtime_error(self, reason: str):
+        # 先保留并打印具体错误原因，再执行安全回 Home
+        self.get_logger().error(f"运行错误原因：{reason}")
+        self.get_logger().warn("检测到运行错误：立即回 Home，并等待下一条 pick/place 指令")
+        self._queue.clear()
+        self._enter_home()
 
     def _reset(self):
         self._cancel_wait_timer()
@@ -1240,7 +1284,7 @@ class ArmWorker(Node):
             try:
                 if hasattr(self.mc, "is_moving"):
                     t0 = time.time()
-                    while time.time() - t0 < 1.5:
+                    while time.time() - t0 < float(self.hw_exec_settle_timeout_sec):
                         if not self.mc.is_moving():
                             break
                         time.sleep(0.05)
@@ -1260,9 +1304,8 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    except Exception as e:
+        print(e)
 
 
 if __name__ == "__main__":
