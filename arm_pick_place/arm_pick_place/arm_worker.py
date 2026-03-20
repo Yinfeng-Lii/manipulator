@@ -183,7 +183,7 @@ class ArmWorker(Node):
         self.regrasp_max_rotate_deg = 45.0
         self.regrasp_loop_max_attempts = 3
         # 闭合值接近“边长抓取”时不旋转的容差
-        self.regrasp_edge_no_rotate_tol = 5
+        self.regrasp_edge_no_rotate_tol = 15
         # 兼容旧字段名（历史版本曾使用 *_value 单点触发）
         self.regrasp_trigger_big_value = 79
         self.regrasp_trigger_small_value = 41
