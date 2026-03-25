@@ -126,6 +126,9 @@ class ArmWorker(Node):
         self.pick_down_box_m = 0.00001
         self.place_goal_box_m = 0.0003
         self.place_down_box_m = 0.0002
+        self.lin_goal_radius_m = 0.0002
+        self.lin_max_vel_scale = 0.08
+        self.lin_max_acc_scale = 0.03
 
         # ---------------- 末端约束：tcp +Y 对齐 base -Z（保持第一版） ----------------
         self.ee_roll_deg = -90.0
@@ -133,7 +136,7 @@ class ArmWorker(Node):
         self.ee_yaw_deg = 0.0
 
         # 允许绕“竖直轴”(tcp 的 Y) 自由转动：放开 about Y
-        self.tilt_tol_rad = 0.15
+        self.tilt_tol_rad = math.radians(3.0)
         self.free_about_y_rad = math.pi
         self.ori_weight = 1.0
 
@@ -697,18 +700,6 @@ class ArmWorker(Node):
                 self.get_logger().error("❌ 坐标必须是数字")
                 return
             
-            OFFSET_Z = 30.0
-            z += OFFSET_Z
-            # ✅  0225新增：纯平移坐标系校正 (Camera XYZ -> Robot XYZ)
-            '''根据实际安装的摄像头位置和机械臂基座位置，进行一个固定的坐标偏移校正。
-            OFFSET_X = 150.0  
-            OFFSET_Y = -200.0 
-            OFFSET_Z = 20.0   
-            
-            x += OFFSET_X
-            y += OFFSET_Y
-            z += OFFSET_Z
-            '''
             # ✅ 0225新增：放置指令同样需要检查是否超出机械臂物理界限
             if not self._check_limits_and_feedback(x, y, z):
                 return
@@ -789,12 +780,16 @@ class ArmWorker(Node):
             else:
                 goal_box_m = self.place_goal_box_m
 
-        req = self._build_plan_request_with_start_state(
-            x, y, z,
-            pipeline_id=pipeline_id,
-            planner_id=planner_id,
-            goal_box_m=goal_box_m,
-        )
+        if planner_id == self.pilz_lin_planner_id:
+            req = self._build_lin_plan_request_with_start_state(x, y, z)
+        else:
+            req = self._build_plan_request_with_start_state(
+                x, y, z,
+                pipeline_id=pipeline_id,
+                planner_id=planner_id,
+                goal_box_m=goal_box_m,
+            )
+
         self.plan_cli.call_async(req).add_done_callback(lambda f: self._on_plan_done(f, token))
 
     def _on_plan_done(self, fut, token: int):
@@ -1141,34 +1136,25 @@ class ArmWorker(Node):
     # =========================================================
     # Build plan request（带 start_state + 末端约束 + LIN 时更小 box）
     # =========================================================
-    def _build_plan_request_with_start_state(
+    def _apply_common_plan_request_fields(
         self,
-        x_mm,
-        y_mm,
-        z_mm,
+        mpr: MotionPlanRequest,
         *,
         pipeline_id=None,
         planner_id=None,
-        goal_box_m=None,
-    ) -> GetMotionPlan.Request:
-        pose = PoseStamped()
-        pose.header.frame_id = self.base_frame
-        pose.pose.position.x = x_mm / 1000.0
-        pose.pose.position.y = y_mm / 1000.0
-        pose.pose.position.z = z_mm / 1000.0
-
-        roll = math.radians(self.ee_roll_deg)
-        pitch = math.radians(self.ee_pitch_deg)
-        yaw = math.radians(self.ee_yaw_deg)
-        pose.pose.orientation = quat_from_rpy(roll, pitch, yaw)
-
-        req = GetMotionPlan.Request()
-        mpr = MotionPlanRequest()
+        max_vel_scale=None,
+        max_acc_scale=None,        
+        ) -> None:
         mpr.group_name = self.group_name
         mpr.allowed_planning_time = self.allowed_planning_time
         mpr.num_planning_attempts = self.num_planning_attempts
-        mpr.max_velocity_scaling_factor = self.max_vel_scale
-        mpr.max_acceleration_scaling_factor = self.max_acc_scale
+        mpr.max_velocity_scaling_factor = (
+            self.max_vel_scale if max_vel_scale is None else float(max_vel_scale)
+        )
+        mpr.max_acceleration_scaling_factor = (
+            self.max_acc_scale if max_acc_scale is None else float(max_acc_scale)
+        )
+
 
         if pipeline_id:
             mpr.pipeline_id = str(pipeline_id)
@@ -1181,9 +1167,91 @@ class ArmWorker(Node):
             js = JointState()
             js.name = self.moveit_joint_names
             js.position = self._last_joint_rad_by_moveit
+            # Pilz LIN 明确要求 start_state 速度为 0；这里显式填零，
+            # 避免某些硬件/驱动链路把缺省值解释成非静止起点。
+            js.velocity = [0.0] * len(self.moveit_joint_names)
             js.header.stamp = self.get_clock().now().to_msg()
             rs.joint_state = js
             mpr.start_state = rs
+    def _build_target_pose(self, x_mm, y_mm, z_mm) -> PoseStamped:
+        pose = PoseStamped()
+        pose.header.frame_id = self.base_frame
+        pose.pose.position.x = x_mm / 1000.0
+        pose.pose.position.y = y_mm / 1000.0
+        pose.pose.position.z = z_mm / 1000.0
+
+        roll = math.radians(self.ee_roll_deg)
+        pitch = math.radians(self.ee_pitch_deg)
+        yaw = math.radians(self.ee_yaw_deg)
+        pose.pose.orientation = quat_from_rpy(roll, pitch, yaw)
+        return pose
+
+    def _build_lin_plan_request_with_start_state(self, x_mm, y_mm, z_mm) -> GetMotionPlan.Request:
+        pose = self._build_target_pose(x_mm, y_mm, z_mm)
+
+        req = GetMotionPlan.Request()
+        mpr = MotionPlanRequest()
+        self._apply_common_plan_request_fields(
+            mpr,
+            pipeline_id=self.pilz_pipeline_id,
+            planner_id=self.pilz_lin_planner_id,
+            max_vel_scale=self.lin_max_vel_scale,
+            max_acc_scale=self.lin_max_acc_scale,
+        )
+
+        c = Constraints()
+
+        # Pilz LIN 对“Pose 风格”的目标更稳定；这里改用球形位置容差，
+        # 避免把 OMPL 风格的 box 目标约束直接喂给 LIN 导致系统性失败。
+        pc = PositionConstraint()
+        pc.header.frame_id = self.base_frame
+        pc.link_name = self.ee_link
+
+        sphere = SolidPrimitive()
+        sphere.type = SolidPrimitive.SPHERE
+        sphere.dimensions = [float(self.lin_goal_radius_m)]
+
+        bv = BoundingVolume()
+        bv.primitives.append(sphere)
+        bv.primitive_poses.append(pose.pose)
+        pc.constraint_region = bv
+        pc.weight = 1.0
+
+        oc = OrientationConstraint()
+        oc.header.frame_id = self.base_frame
+        oc.link_name = self.ee_link
+        oc.orientation = pose.pose.orientation
+        oc.absolute_x_axis_tolerance = float(self.tilt_tol_rad)
+        oc.absolute_y_axis_tolerance = float(self.free_about_y_rad)
+        oc.absolute_z_axis_tolerance = float(self.tilt_tol_rad)
+        oc.weight = float(self.ori_weight)
+
+        c.position_constraints.append(pc)
+        c.orientation_constraints.append(oc)
+        mpr.goal_constraints.append(c)
+
+        req.motion_plan_request = mpr
+        return req
+
+    def _build_plan_request_with_start_state(
+        self,
+        x_mm,
+        y_mm,
+        z_mm,
+        *,
+        pipeline_id=None,
+        planner_id=None,
+        goal_box_m=None,
+    ) -> GetMotionPlan.Request:
+        pose = self._build_target_pose(x_mm, y_mm, z_mm)
+
+        req = GetMotionPlan.Request()
+        mpr = MotionPlanRequest()
+        self._apply_common_plan_request_fields(
+            mpr,
+            pipeline_id=pipeline_id,
+            planner_id=planner_id,
+        )
 
         c = Constraints()
 
