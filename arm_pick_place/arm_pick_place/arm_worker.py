@@ -15,7 +15,7 @@ from pymycobot import MyCobot280  # noqa: E402
 
 import rclpy  # noqa: E402
 from rclpy.node import Node  # noqa: E402
-from std_msgs.msg import String  # noqa: E402
+from std_msgs.msg import String, Bool    # noqa: E402
 from sensor_msgs.msg import JointState  # noqa: E402
 
 from moveit_msgs.srv import GetMotionPlan  # noqa: E402
@@ -146,7 +146,7 @@ class ArmWorker(Node):
         
         # ---------------- Behavior ----------------
         self.pregrasp_offset_mm = 30.0
-        self.pregrasp_wait_sec = 3.0
+        self.pregrasp_wait_sec = 1.5
         self.place_settle_sec = 0.25
 
         # ---------------- Home ----------------
@@ -159,7 +159,7 @@ class ArmWorker(Node):
         # ---------------- Smooth HW exec ----------------
         self.hw_rate_hz = 190.0
         self.hw_time_scale = 0.2
-        self.hw_send_speed = 12
+        self.hw_send_speed = 30
         self.hw_exec_settle_timeout_sec = 1.2
 
         # ---------------- Gripper ----------------
@@ -225,7 +225,9 @@ class ArmWorker(Node):
         # ================= 移植：0225新增：创建发布者，用于向发送指令的节点发送报错/超限信息 =================
         self.feedback_pub = self.create_publisher(String, "arm_feedback", 10)
         # ====================================================================
-        
+        self.holding_state_pub = self.create_publisher(Bool, "arm_holding_state", 10)
+        self.holding_state_timer = self.create_timer(0.1, self._publish_holding_state)
+
         self.js_pub = self.create_publisher(JointState, "/joint_states", 10)
 
         # joint mapping (MoveIt -> HW)
@@ -300,6 +302,12 @@ class ArmWorker(Node):
     # -----------------------------
     def _is_busy(self) -> bool:
         return self.state in (State.PLAN_EXEC, State.WAIT_PRE, State.HOMING)
+
+    def _publish_holding_state(self):
+        msg = Bool()
+        # self.has_object 标志位在抓取验证、掉落检测中会实时更新
+        msg.data = bool(self.has_object)
+        self.holding_state_pub.publish(msg)
 
     # ====================================================================
     # ================= 移植：✅ 0225新增：坐标范围拦截与反馈器函数 =================
