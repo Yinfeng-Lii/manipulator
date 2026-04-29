@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="mycobot_280_mock_ros2_control" params="prefix">
+    <ros2_control name="MockHardwareSystem" type="system">
+      <hardware>
+        <plugin>mock_components/GenericSystem</plugin>
+      </hardware>
+
+      <!-- 机械臂 6 轴：接口用 position（最常见） -->
+      <joint name="${prefix}link1_to_link2"><command_interface name="position"/><state_interface name="position"/></joint>
+      <joint name="${prefix}link2_to_link3"><command_interface name="position"/><state_interface name="position"/></joint>
+      <joint name="${prefix}link3_to_link4"><command_interface name="position"/><state_interface name="position"/></joint>
+      <joint name="${prefix}link4_to_link5"><command_interface name="position"/><state_interface name="position"/></joint>
+      <joint name="${prefix}link5_to_link6"><command_interface name="position"/><state_interface name="position"/></joint>
+      <joint name="${prefix}link6_to_link6_flange"><command_interface name="position"/><state_interface name="position"/></joint>
+
+      <!-- 如果你 MoveIt 配置里有 gripper_controller 这个 joint，也加上 -->
+      <joint name="${prefix}gripper_controller"><command_interface name="position"/><state_interface name="position"/></joint>
+    </ros2_control>
+  </xacro:macro>
+</robot>

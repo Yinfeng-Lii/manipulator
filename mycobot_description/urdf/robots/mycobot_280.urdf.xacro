@@ -1,0 +1,101 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="mycobot_280">
+
+  <!-- ===================== -->
+  <!--        Args           -->
+  <!-- ===================== -->
+  <xacro:arg name="robot_name"    default="mycobot_280"/>
+  <xacro:arg name="add_world"     default="true"/>
+  <xacro:arg name="base_link"     default="base_link"/>
+  <xacro:arg name="base_type"     default="g_shape"/>
+  <xacro:arg name="flange_link"   default="link6_flange"/>
+  <xacro:arg name="gripper_type"  default="adaptive_gripper"/>
+  <xacro:arg name="prefix"        default=""/>
+  <xacro:arg name="use_camera"    default="false"/>
+
+  <!-- 默认 false：不走 Gazebo（MoveIt + mock hardware） -->
+  <xacro:arg name="use_gazebo"    default="false"/>
+  <xacro:arg name="use_gripper"   default="true"/>
+
+  <!-- ===================== -->
+  <!--   World (optional)    -->
+  <!-- ===================== -->
+  <xacro:if value="$(arg add_world)">
+    <link name="world"/>
+    <!-- 注意：SRDF 里通常写 virtual_joint（不带 prefix）；这里也保持不带 prefix -->
+    <joint name="virtual_joint" type="fixed">
+      <parent link="world"/>
+      <child link="$(arg base_link)"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+  </xacro:if>
+
+  <!-- ===================== -->
+  <!--   Base + Arm model    -->
+  <!-- ===================== -->
+  <xacro:property name="current_base" value="$(arg base_type)"/>
+  <xacro:if value="${current_base == 'g_shape'}">
+    <xacro:include filename="$(find mycobot_description)/urdf/mech/g_shape_base_v2_0.urdf.xacro"/>
+    <xacro:g_shape_base base_link="$(arg base_link)" prefix="$(arg prefix)"/>
+  </xacro:if>
+
+  <xacro:include filename="$(find mycobot_description)/urdf/mech/mycobot_280_arm.urdf.xacro"/>
+  <xacro:mycobot_280_arm
+      base_link="$(arg base_link)"
+      flange_link="$(arg flange_link)"
+      prefix="$(arg prefix)">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </xacro:mycobot_280_arm>
+
+  <!-- ===================== -->
+  <!--       Gripper         -->
+  <!-- ===================== -->
+  <xacro:if value="$(arg use_gripper)">
+    <xacro:property name="current_gripper" value="$(arg gripper_type)"/>
+    <xacro:if value="${current_gripper == 'adaptive_gripper'}">
+      <xacro:include filename="$(find mycobot_description)/urdf/mech/adaptive_gripper.urdf.xacro"/>
+
+      <!-- ✅ 关键：把 use_gazebo 传入抓夹宏（你已在抓夹宏内部做了 Gazebo 标签开关 + 新增 tcp） -->
+      <xacro:adaptive_gripper
+          parent="$(arg flange_link)"
+          prefix="$(arg prefix)"
+          use_gazebo="$(arg use_gazebo)">
+        <origin xyz="0 0 0.034" rpy="1.579 0 0"/>
+      </xacro:adaptive_gripper>
+
+    </xacro:if>
+  </xacro:if>
+
+  <!-- ===================== -->
+  <!--   ROS 2 Control (Switchable) -->
+  <!-- ===================== -->
+
+  <!-- A) 不用 Gazebo：用 mock_components/GenericSystem（给 MoveIt/ros2_control “假执行”） -->
+  <xacro:unless value="$(arg use_gazebo)">
+    <xacro:include filename="$(find mycobot_description)/urdf/control/mycobot_280_mock_ros2_control.urdf.xacro"/>
+    <xacro:mycobot_280_mock_ros2_control prefix="$(arg prefix)"/>
+  </xacro:unless>
+
+  <!-- B) 用 Gazebo：才加载 Gazebo 专用插件与 ros2_control 描述 -->
+  <xacro:if value="$(arg use_gazebo)">
+    <xacro:include filename="$(find mycobot_description)/urdf/control/gazebo_sim_ros2_control.urdf.xacro"/>
+    <xacro:load_gazebo_sim_ros2_control_plugin
+        robot_name="$(arg robot_name)"
+        use_gazebo="$(arg use_gazebo)"/>
+
+    <xacro:include filename="$(find mycobot_description)/urdf/control/mycobot_280_ros2_control.urdf.xacro"/>
+    <xacro:mycobot_ros2_control
+        prefix="$(arg prefix)"
+        flange_link="$(arg flange_link)"
+        use_gazebo="$(arg use_gazebo)"/>
+  </xacro:if>
+
+  <!-- ===================== -->
+  <!--        Sensors        -->
+  <!-- ===================== -->
+  <xacro:if value="$(arg use_camera)">
+    <xacro:include filename="$(find mycobot_description)/urdf/sensors/intel_rgbd_cam_d435.urdf.xacro"/>
+    <!-- 如需实例化宏，按你的 d435 文件定义在这里调用 -->
+  </xacro:if>
+
+</robot>
