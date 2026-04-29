@@ -1,0 +1,8 @@
+# Defines the Cartesian movement limits for a robotic arm using the Pilz Planner.
+# The values are typically determined based on a combination of the robot manufacturer's
+# specifications, practical testing, and considerations for the specific tasks the robot will perform.
+cartesian_limits:
+  max_trans_vel: 0.08  # MyCobot 280 的 LIN 动作更适合保守的笛卡尔速度上限，避免频繁触发关节极限失败。
+  max_trans_acc: 0.20 # 与小臂长平台匹配的较低加速度，降低 Pilz 在短距离直线段上的关节超限概率。
+  max_trans_dec: -0.20 # 与加速度同量级的减速度，避免制动阶段同样触发关节约束。
+  max_rot_vel: 0.80   # 旋转速度同步保守收紧，减少姿态保持时的 wrist 关节尖峰速度。
