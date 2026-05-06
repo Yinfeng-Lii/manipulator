@@ -2,7 +2,7 @@
 # The values are typically determined based on a combination of the robot manufacturer's
 # specifications, practical testing, and considerations for the specific tasks the robot will perform.
 cartesian_limits:
-  max_trans_vel: 1.0  # Maximum translational velocity in meters per second. Specifies how fast the end effector can move in space.
-  max_trans_acc: 2.25 # Maximum translational acceleration in meters per second squared. Determines how quickly the end effector can increase its speed.
-  max_trans_dec: -5.0 # Maximum translational deceleration in meters per second squared. Specifies how quickly the end effector can decrease its speed.
-  max_rot_vel: 1.57   # Maximum rotational velocity in radians per second. Controls the speed at which the end effector can rotate.
+  max_trans_vel: 0.08  # MyCobot 280 的 LIN 动作更适合保守的笛卡尔速度上限，避免频繁触发关节极限失败。
+  max_trans_acc: 0.20 # 与小臂长平台匹配的较低加速度，降低 Pilz 在短距离直线段上的关节超限概率。
+  max_trans_dec: -0.20 # 与加速度同量级的减速度，避免制动阶段同样触发关节约束。
+  max_rot_vel: 0.80   # 旋转速度同步保守收紧，减少姿态保持时的 wrist 关节尖峰速度。
